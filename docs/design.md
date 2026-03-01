@@ -35,6 +35,74 @@ flowchart LR
     OR --> EG
     EG --> REC
 ```
+
+## Flow details with redis streams
+```mermaid
+flowchart LR
+
+%% ── External ──
+    PSTN["📞 PSTN Caller"]
+    WEB["🌐 Web / Mobile"]
+    SIP["🔀 SIP Provider"]
+%% ── Infrastructure ──
+    LK["🎙️ LiveKit Server\nSFU · Signaling · Rooms"]
+    TURN["🔁 TURN / STUN"]
+%% ── Merged service ──
+    subgraph ORCH["⚙️ valjean-orchestrator (merged · scale N nodes)"]
+        WH["Webhook Receiver\nPOST /webhook"]
+        WF["Workflow Engine\nSession Manager"]
+        PUB["Stream Publisher\nXADD · XREADGROUP"]
+        WH --> WF --> PUB
+    end
+
+%% ── Redis ──
+    subgraph REDIS["⚡ Redis — Message Bus"]
+        direction TB
+        S_EVT[/"Stream: agent:events\nconsumer group: orchestrators\nAgent → Orch · exactly-once"/]
+        S_CMD[/"Stream: room:{id}:cmds\nconsumer group: agents\nOrch → Agent · exactly-once"/]
+        H_REG[("Hash: room:registry\nroom_id → worker_id\nOwnership routing")]
+        H_SESS[("Hash: sessions:{id}\nRoom state · timestamps\nShared across orch nodes")]
+    end
+
+%% ── Agent workers ──
+    subgraph AGENTS["🤖 valjean-agent-worker (scale M workers)"]
+        AG1["Worker 1\nOwns: room-abc, room-xyz\nSTT → LLM → TTS"]
+        AG2["Worker 2\nOwns: room-def\nSTT → LLM → TTS"]
+    end
+
+%% ── Storage ──
+    DB[("🗄️ CallSessions DB\nPostgres")]
+    REC[("🎞️ Recording Store\nS3 / GCS")]
+    EG["📤 Egress Service"]
+%% ── Call ingress ──
+    PSTN --> SIP --> LK
+    WEB --> LK
+    LK <--> TURN
+%% ── Webhook into orchestrator ──
+    LK -->|" webhook\nroom_started\nparticipant_joined\nroom_finished "| WH
+%% ── Orch → Redis ──
+    PUB -->|" XADD room:{id}:cmds "| S_CMD
+    PUB -->|" HSET room:registry "| H_REG
+    PUB -->|" HSET sessions:{id} "| H_SESS
+    WF -->|persist call record| DB
+%% ── Agent → Redis ──
+    AG1 -->|" XADD agent:events\ntranscript · intent · state "| S_EVT
+    AG2 -->|" XADD agent:events "| S_EVT
+%% ── Redis → Orch (exactly one node) ──
+    S_EVT -->|" XREADGROUP orchestrators\nexactly one orch node "| PUB
+%% ── Redis → Agent (owning worker only) ──
+    S_CMD -->|" XREADGROUP agents\nworker-1 only reads room-abc "| AG1
+    S_CMD -->|" XREADGROUP agents\nworker-2 only reads room-def "| AG2
+%% ── Agent joins LiveKit ──
+    AG1 -->|" join room as participant "| LK
+    AG2 -->|" join room as participant "| LK
+%% ── Egress / recording ──
+    WF -->|" start egress "| EG
+    EG --> REC
+%% ── Registry lookup ──
+    H_REG -.->|" route: which worker owns room? "| PUB
+
+```
 ## Sequence
 
 ``` mermaid
@@ -102,4 +170,66 @@ sequenceDiagram
   LK-->>GW: webhook: egress_ended (file ready)
   GW-->>OR: event: RECORDING_ENDED(url/object_key)
   OR->>DB: persist recording reference
+```
+
+### Demo with console is SIP
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Console SIP (Mac mic/speaker)
+  participant LK as LiveKit Server
+  participant AG as Valjean Agent Worker
+  participant OR as Valjean Orchestration (optional)
+
+  C->>LK: Connect + join room "call-001"
+  AG->>LK: Connect + join room "call-001"
+
+  C->>LK: Publish mic audio track
+  LK->>AG: Forward caller audio
+
+  AG->>AG: STT -> LLM -> TTS
+  AG->>LK: Publish agent audio track
+  LK->>C: Forward agent audio
+
+  Note over C,AG: Interruption
+  C->>LK: Caller speaks during agent TTS
+  LK->>AG: New caller audio frames
+  AG->>AG: interruption triggers -> stop TTS
+  AG->>LK: pauses/stops publishing audio
+```
+###  User Interaction
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (Caller)
+  participant LK as LiveKit Server
+  participant OR as valjean-orchestration
+  participant AG as valjean-agent-worker
+
+  OR->>AG: START(room=call-123, policy)
+  AG->>LK: Connect + join room call-123
+
+  U->>LK: Speak audio
+  LK->>AG: Audio frames
+  AG->>AG: STT -> transcript
+
+  AG-->>OR: EVENT transcript_final("I want refund order 123")
+  OR->>OR: workflow decision (check order/payment)
+  OR-->>AG: CMD say("Sure, checking now...", allow_interruptions=true)
+  AG->>LK: Publish TTS audio
+
+  Note over U,AG: Interruption (barge-in)
+  U->>LK: User starts speaking while TTS playing
+  LK->>AG: New audio frames
+  AG->>AG: Detect turn takeover -> interrupt
+  AG->>LK: Stop/pause TTS output
+  AG-->>OR: EVENT interrupted(turn_id)
+
+  AG->>AG: STT continues
+  AG-->>OR: EVENT transcript_final("Actually cancel that")
+  OR-->>AG: CMD interrupt()
+  OR-->>AG: CMD say("Okay, cancelled.", allow_interruptions=false)
+  AG->>LK: Publish TTS audio
 ```
