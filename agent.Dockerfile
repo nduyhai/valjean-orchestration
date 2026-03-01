@@ -7,10 +7,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 # Copy dependency files first for layer cache
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml ./
 
-# Install deps (no venv — system Python in container is fine)
-RUN uv sync --frozen --no-dev --system
+# Install deps into system Python
+RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy source
 COPY agent.py .
