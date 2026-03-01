@@ -12,5 +12,10 @@ rtc:
   tcp_port: 7881
   use_external_ip: false
 
+webhook:
+  urls:
+    - http://orchestrator:8080/webhook
+  api_key: devkey
+
 logging:
   level: info

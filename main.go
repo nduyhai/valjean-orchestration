@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -15,56 +15,88 @@ import (
 	"github.com/livekit/protocol/webhook"
 )
 
+// ── Config ────────────────────────────────────────────────────────────────────
+
 const (
-	apiKey    = "devkey"
-	apiSecret = "secret"
+	livekitHost   = "ws://localhost:7880"
+	livekitAPIKey = "devkey"
+	livekitSecret = "secret"
+	orchAddr      = ":8080"
+	agentScript   = "../agent/agent.py"
 )
 
-var provider = auth.NewSimpleKeyProvider(apiKey, apiSecret)
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-// --- DEMO in-memory state ---
-type CallSession struct {
-	Room        string
-	AgentPID    int
-	StartedAt   time.Time
-	LastEventAt time.Time
+type AgentState string
+
+const (
+	StateStarting  AgentState = "starting"
+	StateListening AgentState = "listening"
+	StateSpeaking  AgentState = "speaking"
+	StateIdle      AgentState = "idle"
+	StateStopped   AgentState = "stopped"
+)
+
+type Session struct {
+	RoomID    string
+	AgentPID  int
+	State     AgentState
+	StartedAt time.Time
+	UpdatedAt time.Time
 }
 
-var (
-	mu       sync.Mutex
-	sessions = map[string]*CallSession{} // key: room name
-)
-
-// --- Agent event coming back from python worker ---
+// AgentEvent is posted by the Python agent → orchestrator
 type AgentEvent struct {
-	Room       string `json:"room"`
-	Type       string `json:"type"` // transcript|intent|state
-	Transcript string `json:"transcript,omitempty"`
-	Intent     string `json:"intent,omitempty"`
+	Room       string  `json:"room"`
+	Type       string  `json:"type"`       // state_change | transcript | intent
+	State      string  `json:"state"`      // listening | speaking | idle
+	Transcript string  `json:"transcript"` // filled on transcript events
+	Intent     string  `json:"intent"`     // filled on intent events
+	Confidence float64 `json:"confidence"` // STT confidence
 }
 
-// --- Command to agent (demo) ---
+// AgentCommand is sent orchestrator → agent
 type AgentCommand struct {
 	Room   string `json:"room"`
-	Action string `json:"action"` // say|interrupt
+	Action string `json:"action"` // say | interrupt | stop | transfer
 	Text   string `json:"text,omitempty"`
+	Target string `json:"target,omitempty"` // for transfer
 }
 
-func main() {
-	http.HandleFunc("/livekit/webhook", livekitWebhookHandler)
-	http.HandleFunc("/agent/event", agentEventHandler)     // agent -> orchestration
-	http.HandleFunc("/agent/command", agentCommandHandler) // demo: you -> orchestration -> agent
+// ── Orchestrator ──────────────────────────────────────────────────────────────
 
-	log.Println("valjean-orchestration listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+type Orchestrator struct {
+	mu       sync.RWMutex
+	sessions map[string]*Session // key: room ID
+	provider auth.KeyProvider
 }
 
-func livekitWebhookHandler(w http.ResponseWriter, r *http.Request) {
-	// Single call handles body reading + signature verification + unmarshalling
-	evt, err := webhook.ReceiveWebhookEvent(r, provider)
+func NewOrchestrator() *Orchestrator {
+	return &Orchestrator{
+		sessions: make(map[string]*Session),
+		provider: auth.NewSimpleKeyProvider(livekitAPIKey, livekitSecret),
+	}
+}
+
+func (o *Orchestrator) Run() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", o.handleWebhook)        // LiveKit → orchestrator
+	mux.HandleFunc("/agent/event", o.handleAgentEvent) // agent → orchestrator
+	mux.HandleFunc("/health", o.handleHealth)
+
+	log.Printf("[orch] listening on %s", orchAddr)
+	if err := http.ListenAndServe(orchAddr, mux); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ── Webhook handler ───────────────────────────────────────────────────────────
+
+func (o *Orchestrator) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	evt, err := webhook.ReceiveWebhookEvent(r, o.provider)
 	if err != nil {
-		log.Printf("[WEBHOOK] verification failed: %v", err)
-		http.Error(w, "invalid signature", 401)
+		log.Printf("[orch] webhook auth failed: %v", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -77,202 +109,346 @@ func livekitWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		participant = evt.Participant.Identity
 	}
 
-	log.Printf("[WEBHOOK] event=%s room=%s participant=%s\n", evt.Event, room, participant)
+	log.Printf("[orch] webhook event=%s room=%s participant=%s", evt.Event, room, participant)
 
 	switch evt.Event {
+
 	case webhook.EventRoomStarted:
-		ensureSession(room)
+		o.ensureSession(room)
 
 	case webhook.EventParticipantJoined:
-		ensureSession(room)
-		if participant != "" && participant != "agent" {
-			startAgentIfNeeded(room)
+		// Only react to real callers joining, not our own agent
+		if participant != "" && participant != "valjean-agent" {
+			o.ensureSession(room)
+			go o.startAgent(room)
 		}
 
 	case webhook.EventParticipantLeft:
-		stopAgentIfRunning(room)
-
-	case webhook.EventParticipantConnectionAborted:
-		stopAgentIfRunning(room)
+		// If the caller left, stop the agent
+		if participant != "" && participant != "valjean-agent" {
+			go o.stopAgent(room)
+		}
 
 	case webhook.EventRoomFinished:
-		stopAgentIfRunning(room)
-		removeSession(room)
+		go o.stopAgent(room)
+		o.removeSession(room)
 
-	case webhook.EventTrackPublished, webhook.EventTrackUnpublished:
-		touchSession(room)
+	case webhook.EventTrackPublished:
+		o.touchSession(room)
 
-	case webhook.EventEgressStarted, webhook.EventEgressUpdated, webhook.EventEgressEnded:
-		touchSession(room)
-
-	case webhook.EventIngressStarted, webhook.EventIngressEnded:
-		touchSession(room)
-
-	default:
-		ensureSession(room)
-		touchSession(room)
 	}
 
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 }
 
-func agentEventHandler(w http.ResponseWriter, r *http.Request) {
+// ── Agent event handler ───────────────────────────────────────────────────────
+
+func (o *Orchestrator) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	defer r.Body.Close()
+
 	var ev AgentEvent
-	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
-		http.Error(w, "bad json", 400)
+	if err := json.Unmarshal(body, &ev); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("[AGENT->ORCH] room=%s type=%s transcript=%q intent=%q\n",
-		ev.Room, ev.Type, ev.Transcript, ev.Intent,
-	)
+	log.Printf("[orch] agent event room=%s type=%s state=%s transcript=%q",
+		ev.Room, ev.Type, ev.State, ev.Transcript)
 
-	// Demo workflow: if the transcript contains "cancel" -> interrupt + say a line
-	if ev.Type == "transcript" && containsCancel(ev.Transcript) {
-		_ = sendCommandToAgent(AgentCommand{
+	switch ev.Type {
+
+	case "state_change":
+		o.updateSessionState(ev.Room, AgentState(ev.State))
+
+	case "transcript":
+		// Demo workflow: detect intent and respond
+		o.handleTranscript(ev)
+
+	case "intent":
+		log.Printf("[orch] intent detected room=%s intent=%s", ev.Room, ev.Intent)
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleTranscript runs simple intent detection and sends commands back to agent
+func (o *Orchestrator) handleTranscript(ev AgentEvent) {
+	text := ev.Transcript
+
+	switch {
+	case contains(text, "cancel", "stop", "never mind"):
+		log.Printf("[orch] cancel intent detected room=%s", ev.Room)
+		_ = o.sendCommand(AgentCommand{
 			Room:   ev.Room,
 			Action: "interrupt",
 		})
-		_ = sendCommandToAgent(AgentCommand{
+		_ = o.sendCommand(AgentCommand{
 			Room:   ev.Room,
 			Action: "say",
-			Text:   "Okay, cancelling now.",
+			Text:   "Sure, I've cancelled that for you.",
+		})
+
+	case contains(text, "transfer", "speak to human", "real person"):
+		log.Printf("[orch] transfer intent detected room=%s", ev.Room)
+		_ = o.sendCommand(AgentCommand{
+			Room:   ev.Room,
+			Action: "say",
+			Text:   "Let me transfer you now. Please hold.",
+		})
+		_ = o.sendCommand(AgentCommand{
+			Room:   ev.Room,
+			Action: "transfer",
+			Target: "sip:support@example.com",
+		})
+
+	case contains(text, "goodbye", "bye", "hang up"):
+		log.Printf("[orch] hangup intent detected room=%s", ev.Room)
+		_ = o.sendCommand(AgentCommand{
+			Room:   ev.Room,
+			Action: "say",
+			Text:   "Goodbye! Have a great day.",
 		})
 	}
-
-	w.WriteHeader(200)
 }
 
-func agentCommandHandler(w http.ResponseWriter, r *http.Request) {
-	// This endpoint is just for demo manual testing (curl)
-	var cmd AgentCommand
-	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
-		http.Error(w, "bad json", 400)
+func (o *Orchestrator) handleHealth(w http.ResponseWriter, r *http.Request) {
+	o.mu.RLock()
+	count := len(o.sessions)
+	o.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"status":"ok","active_sessions":%d}`, count)
+}
+
+// ── Agent lifecycle ───────────────────────────────────────────────────────────
+
+func (o *Orchestrator) startAgent(room string) {
+	o.mu.RLock()
+	s := o.sessions[room]
+	if s != nil && s.AgentPID != 0 {
+		o.mu.RUnlock()
+		log.Printf("[orch] agent already running for room=%s", room)
 		return
 	}
-	if err := sendCommandToAgent(cmd); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.WriteHeader(200)
-}
+	o.mu.RUnlock()
 
-// ------------------- helpers -------------------
+	log.Printf("[orch] starting agent for room=%s", room)
 
-func ensureSession(room string) {
-	if room == "" {
-		return
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if _, ok := sessions[room]; !ok {
-		sessions[room] = &CallSession{
-			Room:        room,
-			StartedAt:   time.Now(),
-			LastEventAt: time.Now(),
-		}
-	}
-}
-
-func touchSession(room string) {
-	mu.Lock()
-	defer mu.Unlock()
-	if s, ok := sessions[room]; ok {
-		s.LastEventAt = time.Now()
-	}
-}
-
-func removeSession(room string) {
-	mu.Lock()
-	defer mu.Unlock()
-	delete(sessions, room)
-}
-
-func startAgentIfNeeded(room string) {
-	if room == "" {
+	// Generate a LiveKit token for the agent participant
+	token, err := generateAgentToken(room)
+	if err != nil {
+		log.Printf("[orch] failed to generate token: %v", err)
 		return
 	}
 
-	mu.Lock()
-	s := sessions[room]
-	alreadyRunning := s != nil && s.AgentPID != 0
-	mu.Unlock()
-
-	if alreadyRunning {
-		return
-	}
-
-	// Demo: spawn python agent process
-	// Pass room + orchestration callback URL
-	cmd := exec.Command(
-		"python",
-		"agent.py",
+	python := pythonBin()
+	cmd := exec.Command(python, agentScript,
 		"--room", room,
-		"--orchestrator", "http://localhost:8080",
+		"--token", token,
+		"--livekit-url", livekitHost,
+		"--orchestrator", "http://localhost"+orchAddr,
 	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		log.Println("failed to start agent:", err)
+		log.Printf("[orch] failed to start agent: %v", err)
 		return
 	}
 
-	mu.Lock()
-	if sessions[room] != nil {
-		sessions[room].AgentPID = cmd.Process.Pid
-		sessions[room].LastEventAt = time.Now()
+	o.mu.Lock()
+	if s, ok := o.sessions[room]; ok {
+		s.AgentPID = cmd.Process.Pid
+		s.State = StateStarting
+		s.UpdatedAt = time.Now()
 	}
-	mu.Unlock()
+	o.mu.Unlock()
 
-	log.Printf("[ORCH] started agent room=%s pid=%d\n", room, cmd.Process.Pid)
+	log.Printf("[orch] agent started pid=%d room=%s", cmd.Process.Pid, room)
 
-	// Do not Wait() in demo main thread; let it run.
 	go func() {
-		_ = cmd.Wait()
-		log.Printf("[ORCH] agent exited room=%s pid=%d\n", room, cmd.Process.Pid)
+		if err := cmd.Wait(); err != nil {
+			log.Printf("[orch] agent exited with error pid=%d room=%s err=%v",
+				cmd.Process.Pid, room, err)
+		} else {
+			log.Printf("[orch] agent exited cleanly pid=%d room=%s", cmd.Process.Pid, room)
+		}
+		// Clear PID so we can restart if needed
+		o.mu.Lock()
+		if s, ok := o.sessions[room]; ok {
+			s.AgentPID = 0
+			s.State = StateStopped
+		}
+		o.mu.Unlock()
 	}()
 }
 
-func stopAgentIfRunning(room string) {
-	mu.Lock()
-	s := sessions[room]
+func (o *Orchestrator) stopAgent(room string) {
+	o.mu.Lock()
+	s, ok := o.sessions[room]
 	pid := 0
-	if s != nil {
+	if ok && s != nil {
 		pid = s.AgentPID
 		s.AgentPID = 0
+		s.State = StateStopped
 	}
-	mu.Unlock()
+	o.mu.Unlock()
 
 	if pid == 0 {
 		return
 	}
 
-	// Demo: best-effort kill by PID (simple)
-	log.Printf("[ORCH] stopping agent room=%s pid=%d\n", room, pid)
-	// On mac/linux:
-	_ = exec.Command("kill", "-TERM", fmt.Sprintf("%d", pid)).Run()
+	log.Printf("[orch] stopping agent pid=%d room=%s", pid, room)
+
+	// Ask agent to stop gracefully first
+	_ = o.sendCommand(AgentCommand{Room: room, Action: "stop"})
+	time.Sleep(2 * time.Second)
+
+	// Force kill if still running
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Signal(os.Interrupt)
+	}
 }
 
-func sendCommandToAgent(cmd AgentCommand) error {
-	// Demo assumes the agent exposes local control endpoint, e.g. http://localhost:7010/cmd
-	// In production you’d have stable service discovery / per-room routing.
+// sendCommand POSTs a command to the agent's local HTTP server
+func (o *Orchestrator) sendCommand(cmd AgentCommand) error {
+	// Agent exposes :7010/cmd — in production use service discovery
 	url := "http://localhost:7010/cmd"
+	return postJSON(url, cmd)
+}
 
-	b, _ := json.Marshal(cmd)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(b))
+// ── Session helpers ───────────────────────────────────────────────────────────
+
+func (o *Orchestrator) ensureSession(room string) {
+	if room == "" {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, ok := o.sessions[room]; !ok {
+		o.sessions[room] = &Session{
+			RoomID:    room,
+			State:     StateIdle,
+			StartedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		log.Printf("[orch] session created room=%s", room)
+	}
+}
+
+func (o *Orchestrator) touchSession(room string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if s, ok := o.sessions[room]; ok {
+		s.UpdatedAt = time.Now()
+	}
+}
+
+func (o *Orchestrator) updateSessionState(room string, state AgentState) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if s, ok := o.sessions[room]; ok {
+		s.State = state
+		s.UpdatedAt = time.Now()
+		log.Printf("[orch] session state room=%s state=%s", room, state)
+	}
+}
+
+func (o *Orchestrator) removeSession(room string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.sessions, room)
+	log.Printf("[orch] session removed room=%s", room)
+}
+
+// ── Token generation ──────────────────────────────────────────────────────────
+
+func generateAgentToken(room string) (string, error) {
+	at := auth.NewAccessToken(livekitAPIKey, livekitSecret)
+	grant := &auth.VideoGrant{
+		RoomJoin:     true,
+		Room:         room,
+		CanPublish:   func() *bool { b := true; return &b }(),
+		CanSubscribe: func() *bool { b := true; return &b }(),
+	}
+	at.SetVideoGrant(grant).
+		SetIdentity("valjean-agent").
+		SetName("Valjean Agent").
+		SetValidFor(2 * time.Hour)
+
+	return at.ToJWT()
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+func contains(s string, words ...string) bool {
+	lower := []byte(s)
+	for i, c := range lower {
+		if c >= 'A' && c <= 'Z' {
+			lower[i] = c + 32
+		}
+	}
+	for _, w := range words {
+		if indexBytes(lower, []byte(w)) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func indexBytes(s, sub []byte) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if string(s[i:i+len(sub)]) == string(sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+func pythonBin() string {
+	if _, err := exec.LookPath("python3"); err == nil {
+		return "python3"
+	}
+	return "python"
+}
+
+func postJSON(url string, v any) error {
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(resp.Body)
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("agent cmd failed: %s", string(body))
+	resp, err := http.Post(url, "application/json",
+		newBytesReader(b))
+	if err != nil {
+		return err
 	}
+	defer resp.Body.Close()
 	return nil
 }
 
-func containsCancel(s string) bool {
-	// tiny demo helper
-	return len(s) > 0 && (bytes.Contains(bytes.ToLower([]byte(s)), []byte("cancel")))
+type bytesReader struct {
+	b []byte
+	i int
+}
+
+func newBytesReader(b []byte) *bytesReader { return &bytesReader{b: b} }
+func (r *bytesReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.i:])
+	r.i += n
+	return n, nil
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+func main() {
+	log.SetFlags(log.Ltime | log.Lshortfile)
+	o := NewOrchestrator()
+	o.Run()
 }

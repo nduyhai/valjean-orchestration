@@ -1,146 +1,286 @@
-import argparse
+"""
+valjean-agent  —  LiveKit Agents v1.0 style
+============================================================
+Reuses the new AgentServer / AgentSession / Agent API.
+
+Changes from old VoiceAssistant pattern:
+  - Agent class replaces VoiceAssistant
+  - AgentSession wires STT/LLM/TTS/VAD/turn_detection
+  - AgentServer replaces WorkerOptions
+  - Commands from orchestrator still arrive via Flask :7010/cmd
+  - Events (transcript, state) still POST to orchestrator /agent/event
+"""
+
 import asyncio
-import json
+import logging
+import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib import request
 
-# ---- LiveKit Agents imports (adjust to your installed version) ----
-# If your demo currently runs, reuse the same imports/classes you already have.
+import httpx
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
+
 from livekit import rtc
-from livekit.agents.voice import AgentSession
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    JobContext,
+    JobProcess,
+    cli,
+    inference,
+    room_io,
+)
+from livekit.plugins import noise_cancellation, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+load_dotenv(".env.local")
+
+logger = logging.getLogger("valjean.agent")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [agent] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+# ── Config from env ───────────────────────────────────────────────────────────
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
+CMD_PORT         = int(os.getenv("CMD_PORT", "7010"))
+
+# ── Shared state (session lives here so Flask thread can reach it) ────────────
+_active_session: AgentSession | None = None
+_active_loop:    asyncio.AbstractEventLoop | None = None
+_active_room:    str = ""
+
+# ── Sync HTTP client for fire-and-forget events to orchestrator ───────────────
+_http = httpx.Client(timeout=5.0)
 
 
-AGENT_HTTP_PORT = 7010
-
-# Shared session reference so /cmd can call say/interrupt
-SESSION: AgentSession | None = None
-
-def post_json(url: str, payload: dict):
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+def post_event(type_: str, **kwargs):
+    payload = {"room": _active_room, "type": type_, **kwargs}
     try:
-        with request.urlopen(req, timeout=3) as resp:
-            resp.read()
+        _http.post(f"{ORCHESTRATOR_URL}/agent/event", json=payload)
     except Exception as e:
-        print(f"[agent] failed POST {url}: {e}")
+        logger.warning(f"[event] failed to post: {e}")
 
-class CmdHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        global SESSION
 
-        if self.path != "/cmd":
-            self.send_response(404)
-            self.end_headers()
-            return
+# ── Agent ─────────────────────────────────────────────────────────────────────
 
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
-        try:
-            cmd = json.loads(body.decode("utf-8"))
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"bad json")
-            return
+class ValjeanAssistant(Agent):
+    """
+    Valjean voice assistant.
+    Barge-in is handled automatically by AgentSession (MultilingualModel + Silero VAD).
+    We only hook into lifecycle events to report state back to the orchestrator.
+    """
 
-        # cmd: { room, action: say|interrupt, text }
-        action = cmd.get("action")
-        text = cmd.get("text", "")
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=(
+                "You are Valjean, a helpful voice assistant on a phone call. "
+                "Be concise — keep responses under 2 sentences unless asked for detail. "
+                "No markdown, no emojis, no asterisks. Plain spoken language only."
+            ),
+        )
 
-        if SESSION is None:
-            self.send_response(503)
-            self.end_headers()
-            self.wfile.write(b"session not ready")
-            return
+    # ── Session lifecycle ─────────────────────────────────────────────────────
 
-        # Run async calls on the AgentSession loop
-        async def handle():
-            if action == "interrupt":
-                await SESSION.interrupt()
-            elif action == "say":
-                if not text:
-                    return
-                # Allow interruptions by default; you can add allow_interruptions to payload later
-                await SESSION.say(text, allow_interruptions=True)
+    async def on_enter(self):
+        """Called when agent enters the session — greet the caller."""
+        logger.info("[agent] on_enter — greeting caller")
+        post_event("state_change", state="listening")
+        await self.session.generate_reply(
+            instructions="Greet the caller warmly and ask how you can help."
+        )
 
-        asyncio.run_coroutine_threadsafe(handle(), SESSION.loop)
+    async def on_exit(self):
+        logger.info("[agent] on_exit")
+        post_event("state_change", state="stopped")
 
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
+    # ── Turn hooks ────────────────────────────────────────────────────────────
 
-def start_cmd_server():
-    server = HTTPServer(("0.0.0.0", AGENT_HTTP_PORT), CmdHandler)
-    print(f"[agent] cmd server listening on :{AGENT_HTTP_PORT}")
-    server.serve_forever()
+    async def on_user_turn_completed(self, turn_ctx, new_message):
+        """STT has finalised the caller's utterance — report transcript."""
+        transcript = ""
+        if new_message and new_message.content:
+            if isinstance(new_message.content, str):
+                transcript = new_message.content
+            else:
+                transcript = " ".join(
+                    p.text for p in new_message.content if hasattr(p, "text")
+                )
 
-async def main():
-    global SESSION
+        logger.info(f"[transcript] {transcript!r}")
+        post_event("transcript", transcript=transcript)
+        post_event("state_change", state="thinking")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--room", required=True)
-    parser.add_argument("--orchestrator", required=True)  # e.g. http://localhost:8080
-    parser.add_argument("--livekit-url", default="ws://localhost:7880")
-    parser.add_argument("--api-key", default="devkey")
-    parser.add_argument("--api-secret", default="secret")
-    args = parser.parse_args()
+        await super().on_user_turn_completed(turn_ctx, new_message)
 
-    # Create token for identity "agent"
-    # For demo, easiest is to generate token via your orchestrator or a small helper.
-    # Here’s a simple approach: use livekit server-sdk in Go normally.
-    #
-    # If your existing demo agent already connects successfully, reuse that token code.
-    #
-    # Placeholder: you MUST replace get_token() with your token generation.
-    from livekit.api import AccessToken, VideoGrants  # works if livekit-api python installed
+    async def on_agent_turn_started(self, turn_ctx):
+        post_event("state_change", state="speaking")
+        await super().on_agent_turn_started(turn_ctx)
 
-    token = (
-        AccessToken(args.api_key, args.api_secret)
-        .with_identity("agent")
-        .with_name("agent")
-        .with_grants(VideoGrants(room_join=True, room=args.room))
-        .to_jwt()
+    async def on_agent_turn_completed(self, turn_ctx, new_message):
+        post_event("state_change", state="listening")
+        await super().on_agent_turn_completed(turn_ctx, new_message)
+
+    # ── Barge-in ──────────────────────────────────────────────────────────────
+
+    async def on_user_interrupted(self):
+        """
+        Fired by the SDK when caller speaks while agent is talking.
+        SDK has already stopped TTS — we just report the state change.
+        """
+        logger.info("[agent] *** BARGE-IN — caller interrupted agent ***")
+        post_event("state_change", state="listening")
+        await super().on_user_interrupted()
+
+
+# ── AgentServer setup ─────────────────────────────────────────────────────────
+
+server = AgentServer()
+
+
+def prewarm(proc: JobProcess):
+    """Load VAD model once per worker process — reused across all sessions."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+server.setup_fnc = prewarm
+
+
+@server.rtc_session(agent_name="valjean-agent")
+async def valjean_session(ctx: JobContext):
+    global _active_session, _active_loop, _active_room
+
+    ctx.log_context_fields = {"room": ctx.room.name}
+    _active_room = ctx.room.name
+    _active_loop = asyncio.get_running_loop()
+
+    logger.info(f"[session] starting room={ctx.room.name}")
+    post_event("state_change", state="starting")
+
+    session = AgentSession(
+        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        llm=inference.LLM(model="openai/gpt-4.1-mini"),
+        tts=inference.TTS(
+            model="cartesia/sonic-3",
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
+        turn_detection=MultilingualModel(),
+        vad=ctx.proc.userdata["vad"],
+        preemptive_generation=True,
     )
 
-    room = rtc.Room()
-    await room.connect(args.livekit_url, token)
-    print(f"[agent] connected, joined room={args.room} identity=agent")
+    _active_session = session
 
-    # Create AgentSession (your voice pipeline)
-    SESSION = AgentSession(room=room)
-    # Expose session loop for run_coroutine_threadsafe
-    SESSION.loop = asyncio.get_running_loop()
+    await session.start(
+        agent=ValjeanAssistant(),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                # Telephony noise cancellation for SIP callers, standard BVC for WebRTC
+                noise_cancellation=lambda params: (
+                    noise_cancellation.BVCTelephony()
+                    if params.participant.kind
+                       == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                    else noise_cancellation.BVC()
+                ),
+            ),
+        ),
+    )
 
-    # Start command server in background thread
-    threading.Thread(target=start_cmd_server, daemon=True).start()
+    await ctx.connect()
+    logger.info(f"[session] connected room={ctx.room.name}")
 
-    # Hook: when user transcript is ready
-    @SESSION.on("user_input_transcribed")
-    async def on_transcript(ev):
-        # ev.transcript, ev.is_final, ev.language, ev.speaker_id (depends on version)
-        text = getattr(ev, "transcript", "")
-        is_final = getattr(ev, "is_final", True)
 
-        if not text:
-            return
+# ── Command dispatch (async, runs on agent loop) ──────────────────────────────
 
-        if is_final:
-            post_json(
-                f"{args.orchestrator}/agent/event",
-                {
-                    "room": args.room,
-                    "type": "transcript",
-                    "transcript": text,
-                },
-            )
+async def _dispatch_command(session: AgentSession, cmd: dict):
+    action = cmd.get("action")
 
-    # Start the session
-    await SESSION.start()
+    if action == "say":
+        # Orchestrator-driven speech — inject as an LLM instruction
+        await session.generate_reply(
+            instructions=f"Say exactly this to the user: {cmd.get('text', '')}"
+        )
 
-    # Keep running until disconnected
-    while True:
-        await asyncio.sleep(1)
+    elif action == "interrupt":
+        session.interrupt()
+        logger.info("[cmd] session interrupted")
+
+    elif action == "transfer":
+        target = cmd.get("target", "")
+        logger.info(f"[cmd] transfer to {target}")
+        await session.generate_reply(
+            instructions="Tell the user you are transferring them now and to please hold."
+        )
+        # TODO: call LiveKit SIP transfer API
+
+    elif action == "stop":
+        logger.info("[cmd] stop — interrupting session")
+        session.interrupt()
+        # Room disconnect is handled by the job lifecycle / orchestrator
+
+    else:
+        logger.warning(f"[cmd] unknown action: {action}")
+
+
+# ── Flask command server ──────────────────────────────────────────────────────
+
+def build_cmd_server() -> Flask:
+    app = Flask(__name__)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    @app.post("/cmd")
+    def cmd_endpoint():
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "no json"}), 400
+
+        if _active_session is None or _active_loop is None:
+            return jsonify({"error": "no active session"}), 503
+
+        logger.info(f"[cmd] action={data.get('action')}")
+        future = asyncio.run_coroutine_threadsafe(
+            _dispatch_command(_active_session, data),
+            _active_loop,
+        )
+        try:
+            future.result(timeout=10)
+        except Exception as e:
+            logger.error(f"[cmd] dispatch error: {e}")
+            return jsonify({"error": str(e)}), 500
+
+        return jsonify({"ok": True})
+
+    @app.get("/health")
+    def health():
+        return jsonify({
+            "room":  _active_room,
+            "state": "active" if _active_session else "idle",
+        })
+
+    return app
+
+
+def start_cmd_server():
+    app = build_cmd_server()
+    t = threading.Thread(
+        target=lambda: app.run(
+            host="0.0.0.0",
+            port=CMD_PORT,
+            debug=False,
+            use_reloader=False,
+        ),
+        daemon=True,
+        name="cmd-server",
+    )
+    t.start()
+    logger.info(f"[cmd-server] listening on :{CMD_PORT}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    start_cmd_server()
+    cli.run_app(server)

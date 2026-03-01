@@ -1,45 +1,72 @@
+version: "3.9"
+
+# ── Valjean demo stack ────────────────────────────────────────────────────────
+# Usage:
+#   cp .env.example .env        # fill in OPENAI_API_KEY, DEEPGRAM_API_KEY
+#   docker compose up --build
+
 services:
+
+  # ── Redis (required by LiveKit for distributed state) ─────────────────────
   redis:
     image: redis:7-alpine
-    command: [ "redis-server", "--appendonly", "yes" ]
-    volumes:
-      - redis_data:/data
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
 
+  # ── LiveKit server ─────────────────────────────────────────────────────────
   livekit:
     image: livekit/livekit-server:latest
-    depends_on:
-      - redis
+    command: --config /etc/livekit/livekit.yaml
     ports:
-      - "7880:7880"
-      - "7881:7881"
-      - "3478:3478/udp"
-      - "50000-60000:50000-60000/udp"
+      - "7880:7880"             # WebSocket / HTTP
+      - "7881:7881"             # TURN/TCP
+      - "50000-60000:50000-60000/udp"  # RTC UDP range (matches livekit.yaml)
     volumes:
-      - ./livekit.yaml:/livekit.yaml:ro
-    command: [ "--config", "/livekit.yaml" ]
-
-  sip:
-    image: livekit/sip:latest
+      - ./livekit.yaml:/etc/livekit/livekit.yaml:ro
     depends_on:
-      - redis
-      - livekit
-    ports:
-      - "5060:5060/udp"
-      - "10000-20000:10000-20000/udp"
-    environment:
-      SIP_CONFIG_BODY: |
-        api_key: 'devkey'
-        api_secret: 'secret'
-        ws_url: 'ws://livekit:7880'
-        redis:
-          address: 'redis:6379'
-        sip_port: 5060
-        rtp_port: 10000-20000
-        use_external_ip: false
-        logging:
-          level: debug
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7880/"]
+      interval: 5s
+      retries: 10
 
-volumes:
-  redis_data:
+  # ── Orchestrator (Go) — built from repo root ──────────────────────────────
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      LIVEKIT_URL:    ws://livekit:7880
+      LIVEKIT_KEY:    devkey
+      LIVEKIT_SECRET: secret
+      ADDR:           :8080
+    depends_on:
+      livekit:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Agent worker (Python) — built from repo root ──────────────────────────
+  # Scale with: docker compose up --scale agent-worker=3
+  agent-worker:
+    build:
+      context: .
+      dockerfile: agent.Dockerfile
+    ports:
+      - "7010:7010"
+    environment:
+      LIVEKIT_URL:      ws://livekit:7880
+      LIVEKIT_KEY:      devkey
+      LIVEKIT_SECRET:   secret
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      OPENAI_API_KEY:   ${OPENAI_API_KEY}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      CMD_PORT:         "7010"
+    depends_on:
+      - orchestrator
+    restart: unless-stopped

@@ -1,24 +1,22 @@
-# ---------- build stage ----------
-FROM golang:1.26 AS build
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM golang:1.22-alpine AS build
 WORKDIR /src
 
-# Cache deps
+# Cache deps separately from source
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source
+# Copy all source (main.go is at repo root)
 COPY . .
 
-# Build the cmd/bot target
-# (strip symbols, static binary)
+# Static binary — strip debug symbols
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /out/valjean ./cmd/bot
+    go build -ldflags="-s -w" -o /out/valjean .
 
-# ---------- runtime stage ----------
-FROM gcr.io/distroless/base-debian12:latest
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /
 COPY --from=build /out/valjean /valjean
 ENV ADDR=:8080
 EXPOSE 8080
-USER nonroot:nonroot
 ENTRYPOINT ["/valjean"]
