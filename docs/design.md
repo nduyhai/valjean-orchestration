@@ -176,60 +176,34 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-  autonumber
-  participant C as Console SIP (Mac mic/speaker)
-  participant LK as LiveKit Server
-  participant AG as Valjean Agent Worker
-  participant OR as Valjean Orchestration (optional)
+    autonumber
+    participant C as Console SIP (Mac mic/speaker)
+    participant LK as LiveKit Server
+    participant WH as LiveKit Webhook -> Valjean Orchestration
+    participant OR as Valjean Orchestration (Router/Controller)
+    participant AG as Valjean Agent Worker
 
-  C->>LK: Connect + join room "call-001"
-  AG->>LK: Connect + join room "call-001"
+    C->>LK: Connect + join room "call-001"
+    LK-->>WH: webhook: participant_joined (Console/SIP)
+    WH-->>OR: deliver event (room=call-001, participant=C)
 
-  C->>LK: Publish mic audio track
-  LK->>AG: Forward caller audio
+    OR->>OR: Decide agent needed? allocate worker
+    OR->>AG: Wake/Start job (room=call-001, token, config)
+    AG->>LK: Connect + join room "call-001" (as agent participant)
 
-  AG->>AG: STT -> LLM -> TTS
-  AG->>LK: Publish agent audio track
-  LK->>C: Forward agent audio
+    C->>LK: Publish mic audio track
+    LK->>AG: Forward caller audio (RTC frames)
 
-  Note over C,AG: Interruption
-  C->>LK: Caller speaks during agent TTS
-  LK->>AG: New caller audio frames
-  AG->>AG: interruption triggers -> stop TTS
-  AG->>LK: pauses/stops publishing audio
-```
-###  User Interaction
+    AG->>AG: VAD + STT -> LLM -> TTS
+    AG->>LK: Publish agent audio track
+    LK->>C: Forward agent audio
 
-```mermaid
-sequenceDiagram
-  autonumber
-  participant U as User (Caller)
-  participant LK as LiveKit Server
-  participant OR as valjean-orchestration
-  participant AG as valjean-agent-worker
-
-  OR->>AG: START(room=call-123, policy)
-  AG->>LK: Connect + join room call-123
-
-  U->>LK: Speak audio
-  LK->>AG: Audio frames
-  AG->>AG: STT -> transcript
-
-  AG-->>OR: EVENT transcript_final("I want refund order 123")
-  OR->>OR: workflow decision (check order/payment)
-  OR-->>AG: CMD say("Sure, checking now...", allow_interruptions=true)
-  AG->>LK: Publish TTS audio
-
-  Note over U,AG: Interruption (barge-in)
-  U->>LK: User starts speaking while TTS playing
-  LK->>AG: New audio frames
-  AG->>AG: Detect turn takeover -> interrupt
-  AG->>LK: Stop/pause TTS output
-  AG-->>OR: EVENT interrupted(turn_id)
-
-  AG->>AG: STT continues
-  AG-->>OR: EVENT transcript_final("Actually cancel that")
-  OR-->>AG: CMD interrupt()
-  OR-->>AG: CMD say("Okay, cancelled.", allow_interruptions=false)
-  AG->>LK: Publish TTS audio
+    Note over C,AG: Interruption (barge-in)
+    C->>LK: Caller speaks during agent TTS
+    LK->>AG: New caller audio frames (immediate)
+    AG->>AG: VAD detects speech -> interrupt() -> stop TTS
+    AG->>LK: Stop/pause agent audio publication (or mute)
+    AG->>AG: Switch to Listening -> STT...
+    LK-->>WH: webhook: track_published / active_speaker (optional)
+    WH-->>OR: OR observes events (not in the critical path)
 ```
