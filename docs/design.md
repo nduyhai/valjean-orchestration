@@ -3,7 +3,6 @@
 ## Flow
 ```mermaid
 flowchart LR
-
     PSTN["Phone Caller (PSTN)"]
     WEB["Web / Mobile Client"]
     SIPPROV["SIP Trunk Provider"]
@@ -11,14 +10,14 @@ flowchart LR
     LK["LiveKit Server\n(SFU + Signaling)"]
     TURN["TURN / STUN"]
 
-    GW["valjean-gateway\nWebhook Receiver"]
-    OR["valjean-orchestrator\nWorkflow Engine"]
-    AG["valjean-agent-worker\nSTT → LLM → TTS"]
+    GW["valjean-gateway\nWebhook Receiver + Temporal Starter"]
+    TEMP["Temporal Cluster\n(Workflow + Task Queues)"]
+
+    AGW["valjean-agent-worker\nTemporal Worker\nSTT → LLM → TTS"]
+    EGW["valjean-egress-worker\nTemporal Worker\nRecording/Egress"]
 
     DB[("CallSessions DB")]
     REC[("Recording Storage")]
-
-    EG["Egress Service"]
 
     PSTN --> SIPPROV
     SIPPROV --> LK
@@ -26,14 +25,17 @@ flowchart LR
     LK --> TURN
 
     LK -->|webhook| GW
-    GW --> OR
+    GW -->|Start/Signal Workflow| TEMP
 
-    OR -->|start agent| AG
-    AG -->|join room| LK
+    TEMP -->|Activity: allocate agent + room token| AGW
+    AGW -->|join room| LK
+    AGW -->|publish agent audio| LK
 
-    OR --> DB
-    OR --> EG
-    EG --> REC
+    TEMP -->|Activity: start/stop egress| EGW
+    EGW -->|egress API| LK
+    EGW --> REC
+
+    TEMP --> DB
 ```
 
 ## Flow details with redis streams
